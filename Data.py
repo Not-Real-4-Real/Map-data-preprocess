@@ -25,7 +25,6 @@ class Edge:
     geometry: list = field(default_factory=list)   # [(lat, lon), ...] for drawing
     density: float = 0.0           # 0 (empty) .. 1 (jammed)
     weather_factor: float = 1.0    # 0..1
-    incident_factor: float = 1.0   # 0..1
     blocked: bool = False
 
     @property
@@ -33,7 +32,7 @@ class Edge:
         """km/h. Placeholder model: speed drops linearly with density
         (Greenshields), then weather/incident multipliers apply."""
         speed = self.speed_limit * (1 - self.density)
-        speed *= self.weather_factor * self.incident_factor
+        speed *= self.weather_factor
         return max(speed, self.speed_limit * MIN_SPEED_FACTOR)
 
     @property
@@ -121,10 +120,48 @@ def load_graph(bbox) -> Graph:
     return g
 
 @dataclass
+class Hotspot:
+    lat: float
+    lon: float
+    intensity: float = 1.0
+    radius: float = 500.0       # meters
+
+def hotspot_intensity(distance, hotspot):
+    return hotspot.intensity * math.exp(
+        -(distance ** 2) / (2 * hotspot.radius ** 2)
+    )
+
+@dataclass
+class RainCell:
+    min_lat: float
+    max_lat: float
+    min_lon: float
+    max_lon: float
+    weather_factor: float = 0.6
+
+@dataclass
 class ScenarioConfig:
-    min_density: float = 0.0
+    base_density: float = 0.1
     max_density: float = 0.9   # keep below 1 so the speed floor is rarely hit
-    block_probability: float = 0.05
+    density_deviation: float = 0.05
+    hotspots: list[Hotspot] = field(default_factory=list)
+
+    block_probability: float = 0.03
+
+    global_weather_factor: float = 1.0
+    rain_cells: list[RainCell] = field(default_factory=list)
+
+def road_midpoint(geometry):
+    n = len(geometry)
+
+    if n % 2 == 1:
+        return geometry[n // 2]
+
+    (lat1, lon1), (lat2, lon2) = geometry[n // 2 - 1], geometry[n // 2]
+    return (
+        (lat1 + lat2) / 2,
+        (lon1 + lon2) / 2
+    )
 
 def _roads(graph):
     """Yield (edge, twin) once per physical road.
@@ -146,14 +183,58 @@ class ScenarioGenerator: #randomly assign density to edge
         """One call = one snapshot. Overwrites any earlier scenario on the graph."""
         self._assign_density(graph)
         self._assign_incidents(graph)
+        self._assign_weather(graph)
 
     def _assign_density(self, graph: Graph) -> None:
         rng = random.Random(self.seed)
         cfg = self.config
+
         for edge, twin in _roads(graph):
-            edge.density = rng.uniform(cfg.min_density, cfg.max_density)
+
+            lat, lon = road_midpoint(edge.geometry)
+
+            # General traffic level affecting every road
+            density = cfg.base_density
+
+            # Add influence from congestion hotspots
+            hotspot_effect = 0.0
+
+            for hotspot in cfg.hotspots:
+                distance = haversine_m(
+                    lat,
+                    lon,
+                    hotspot.lat,
+                    hotspot.lon
+                )
+
+                influence = hotspot_intensity(distance, hotspot)
+
+                hotspot_effect = max(
+                    hotspot_effect,
+                    influence
+                )
+
+            # Scale hotspot influence into density
+            density += (
+                cfg.max_density - cfg.base_density
+            ) * hotspot_effect
+
+            # Small random local variation
+            density += rng.uniform(
+                -cfg.density_deviation,
+                cfg.density_deviation
+            )
+
+            # Keep density within valid range
+            density = max(
+                0.0,
+                min(cfg.max_density, density)
+            )
+
+            edge.density = density
+
             if twin:
-                twin.density = edge.density
+                twin.density = density
 
     def _assign_incidents(self, graph: Graph) -> None:
         rng = random.Random(f"incidents-{self.seed}")   # separate random stream
@@ -161,6 +242,30 @@ class ScenarioGenerator: #randomly assign density to edge
             edge.blocked = rng.random() < self.config.block_probability
             if twin:
                 twin.blocked = edge.blocked
+
+    def _assign_weather(self, graph: Graph) -> None:
+        cfg = self.config
+
+        for edge, twin in _roads(graph):
+
+            lat, lon = road_midpoint(edge.geometry)
+
+            weather = cfg.global_weather_factor
+
+            for rain_cell in cfg.rain_cells:
+                inside = (
+                    rain_cell.min_lat <= lat <= rain_cell.max_lat
+                    and
+                    rain_cell.min_lon <= lon <= rain_cell.max_lon
+                )
+
+                if inside:
+                    weather *= rain_cell.weather_factor
+
+            edge.weather_factor = weather
+
+            if twin:
+                twin.weather_factor = weather
 
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
     """Great-circle distance in meters."""
@@ -170,149 +275,3 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
-
-import folium
-from folium.plugins import PolyLineTextPath
-from branca.colormap import LinearColormap  
-
-# ---------- 1. Test the parser ----------
-assert parse_maxspeed(None) == 40
-assert parse_maxspeed("50") == 50
-assert parse_maxspeed("50;60") == 50
-assert parse_maxspeed(["50", "40"]) == 40
-assert abs(parse_maxspeed("40 mph") - 64.36) < 0.1
-assert parse_maxspeed("walk") == 40
-print("parse_maxspeed: all tests passed\n")
-
-# ---------- 2. Load a small region (~0.9 km x 0.9 km) ----------
-small_bbox = (106.694, 10.769, 106.702, 10.777)   # left, bottom, right, top
-g = load_graph(small_bbox)
-
-n_edges = sum(len(t) for t in g.adj.values())
-n_oneway = sum(e.oneway for t in g.adj.values() for e in t.values())
-print(f"{len(g.vertices)} vertices, {n_edges} directed edges "
-      f"({n_oneway} one-way), v_max = {g.v_max:.0f} km/h\n")
-
-# ---------- 3. Print everything ----------
-print("VERTICES")
-for v in g.vertices.values():
-    print(f"  {v.id}: lat={v.y:.6f}, lon={v.x:.6f}")
-
-print("\nEDGES")
-for u in g.adj:
-    for e in g.adj[u].values():
-        print(f"  {e.source} -> {e.target} | {e.length:7.1f} m | "
-              f"{e.speed_limit:4.0f} km/h | oneway={e.oneway} | "
-              f"pts={len(e.geometry)} | {e.name or '-'}")
-
-# ---------- 4. Try the computed properties ----------
-e = next(iter(next(iter(g.adj.values())).values()), None) or \
-    next(x for t in g.adj.values() for x in t.values())
-print(f"\nSample edge {e.source}->{e.target}: "
-      f"free-flow {e.travel_time:.1f} s", end="")
-e.density, e.weather_factor = 0.5, 0.8
-print(f", with density 0.5 and weather 0.8: {e.current_speed:.1f} km/h, "
-      f"{e.travel_time:.1f} s")
-e.density, e.weather_factor = 0.0, 1.0   # reset
-
-# ---------- 5. Generate the scenario ----------
-cfg = ScenarioConfig(min_density=0.0, max_density=0.9, block_probability=0.05)
-ScenarioGenerator(seed=424545, config=cfg).apply(g)
-
-n_blocked = sum(e.blocked for t in g.adj.values() for e in t.values())
-print(f"Blocked edges: {n_blocked} of {n_edges}")
-
-for u in g.adj:                            # a two-way road is blocked in both directions or neither
-    for v, e in g.adj[u].items():
-        if not e.oneway:
-            assert g.adj[v][u].blocked == e.blocked
-
-# ---------- 6. Map built only from Graph data ----------
-cx = sum(v.x for v in g.vertices.values()) / len(g.vertices)
-cy = sum(v.y for v in g.vertices.values()) / len(g.vertices)
-
-m = folium.Map(location=[cy, cx], zoom_start=17, tiles=None)
-
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
-    attr="Tiles © Esri",
-    name="Esri Streets",
-    max_zoom=19,
-).add_to(m)
-
-# green (free) -> yellow -> red (jam), with a legend on the map
-cmap = LinearColormap(
-    ["#1a9850", "#fee08b", "#d73027"],
-    vmin=cfg.min_density, vmax=cfg.max_density,
-    caption="Traffic density (green = free flow, red = jam)",
-)
-cmap.add_to(m)
-
-def density_color(d: float) -> str:
-    return cmap(d)[:7]                     # strip the alpha channel
-
-def road_midpoint(geometry):
-    """A point in the middle of the drawn road, used to place the closure sign."""
-    n = len(geometry)
-    if n % 2 == 1:
-        return geometry[n // 2]
-    (lat1, lon1), (lat2, lon2) = geometry[n // 2 - 1], geometry[n // 2]
-    return ((lat1 + lat2) / 2, (lon1 + lon2) / 2)
-
-# red circle with a white bar = "no entry"
-NO_ENTRY_HTML = (
-    '<div style="box-sizing:border-box;width:18px;height:18px;border-radius:50%;'
-    'background:#d00;border:2px solid white;box-shadow:0 0 3px rgba(0,0,0,.7);'
-    'display:flex;align-items:center;justify-content:center;">'
-    '<div style="width:9px;height:3px;background:white;"></div></div>'
-)
-
-closed_layer = folium.FeatureGroup(name="Closed roads").add_to(m)   # can be toggled on/off
-
-for u in g.adj:
-    for e in g.adj[u].values():
-        if not e.oneway and e.source > e.target:
-            continue                       # two-way roads share one state, draw once
-
-        if e.blocked:
-            label = (f"CLOSED | {e.name or '-'} | "
-                     f"{'one-way' if e.oneway else 'two-way'} | {e.length:.0f} m")
-            folium.PolyLine(e.geometry, color="#444444", weight=5, opacity=0.9,
-                            dash_array="4 8", tooltip=label).add_to(closed_layer)
-            folium.Marker(road_midpoint(e.geometry),
-                          icon=folium.DivIcon(html=NO_ENTRY_HTML,
-                                              icon_size=(18, 18), icon_anchor=(9, 9)),
-                          tooltip=label).add_to(closed_layer)
-            continue
-
-        color = density_color(e.density)
-        line = folium.PolyLine(
-            e.geometry,
-            color=color,
-            weight=4,
-            opacity=0.9,
-            tooltip=(f"{e.name or '-'} | {'one-way' if e.oneway else 'two-way'} | "
-                     f"density {e.density:.2f} | {e.current_speed:.0f} km/h | "
-                     f"{e.length:.0f} m, {e.travel_time:.0f} s"),
-        ).add_to(m)
-        if e.oneway:                       # arrows show the allowed direction
-            PolyLineTextPath(line, "   ►   ", repeat=True, offset=6,
-                             attributes={"fill": color, "font-size": "14"}).add_to(m)
-
-for v in g.vertices.values():
-    folium.CircleMarker([v.y, v.x], radius=2, color="black",
-                        tooltip=str(v.id)).add_to(m)
-
-legend_html = """
-<div style="position: fixed; bottom: 24px; left: 12px; z-index: 9999; background: white;
-            padding: 8px 10px; border: 1px solid #999; border-radius: 4px; font-size: 13px;">
-  <div><span style="display:inline-block;width:30px;border-top:4px dashed #444;
-        vertical-align:middle;"></span>&nbsp;Closed road (incident)</div>
-  <div>&#9658; arrows = direction of a one-way road</div>
-</div>
-"""
-m.get_root().html.add_child(folium.Element(legend_html))
-
-folium.LayerControl().add_to(m)
-m.save("graph_test_map.html")
-print("\nSaved graph_test_map.html")
