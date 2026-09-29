@@ -129,6 +129,100 @@ def heuristic_birdfly(graph: Graph, node: int, goal: int, samples = 10, local_vm
 
     return distance / estimated_speed
 
+def heuristic_birdfly_v2(
+    graph: Graph,
+    node: int,
+    goal: int,
+    samples=10,
+    local_vmax=False
+) -> float:
+
+    current = graph.vertices[node]
+    target = graph.vertices[goal]
+
+    distance = haversine_m(
+        current.y, current.x,
+        target.y, target.x
+    )
+
+    if distance == 0:
+        return 0.0
+
+    reference_edges = []
+
+    for i in range(1, samples + 1):
+        t = i / samples
+
+        lat = current.y + t * (target.y - current.y)
+        lon = current.x + t * (target.x - current.x)
+
+        nearest_edge = None
+        nearest_distance = math.inf
+
+        for edges in graph.adj.values():
+            for edge in edges.values():
+                midpoint_lat, midpoint_lon = road_midpoint(
+                    edge.geometry
+                )
+
+                d = haversine_m(
+                    lat,
+                    lon,
+                    midpoint_lat,
+                    midpoint_lon
+                )
+
+                if d < nearest_distance:
+                    nearest_distance = d
+                    nearest_edge = edge
+
+        if nearest_edge is not None:
+            reference_edges.append(nearest_edge)
+
+    if not reference_edges:
+        return math.inf
+
+    # --------------------------------------------------
+    # Estimate v_max
+    # --------------------------------------------------
+
+    if local_vmax:
+        v_max = max(
+            edge.speed_limit
+            for edge in reference_edges
+        )
+    else:
+        v_max = graph.v_max
+
+    v_max /= 3.6  # km/h -> m/s
+
+    # --------------------------------------------------
+    # Bird-flight v2:
+    # calculate effective speed PER sampled road,
+    # then average those speeds
+    # --------------------------------------------------
+
+    estimated_speeds = []
+
+    for edge in reference_edges:
+        speed = (
+            v_max
+            * (1 - edge.density)
+            * edge.weather_factor
+        )
+
+        estimated_speeds.append(speed)
+
+    estimated_speed = (
+        sum(estimated_speeds)
+        / len(estimated_speeds)
+    )
+
+    if estimated_speed <= 0:
+        return math.inf
+
+    return distance / estimated_speed
+
 def astar(graph: Graph, start: int, goal: int, heuristic_fn = heuristic):
     """
     A* search using travel time as the edge cost.
